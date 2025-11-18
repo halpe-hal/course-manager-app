@@ -1,0 +1,8 @@
+streamlit
+supabase
+supabase-py
+pandas
+python-dotenv
+streamlit-aggrid
+streamlit-autorefresh
+requests
