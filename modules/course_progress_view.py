@@ -815,7 +815,6 @@ def show_served_list():
                         if main_choice:
                             display_name = main_choice
 
-
                 st.markdown(
                     f"""
                     <div style="margin-top:4px; margin-bottom:4px;">
