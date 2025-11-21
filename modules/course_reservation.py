@@ -279,28 +279,47 @@ def delete_reservation(reservation_id: str):
 def show():
     st.subheader("コース予約登録")
 
+    # 前回成功時のメッセージを表示（1回だけ）
+    success_msg = st.session_state.pop("reservation_success_message", None)
+    if success_msg:
+        st.success(success_msg)
+
     courses = fetch_courses()
     if not courses:
         st.warning("有効なコースがまだ登録されていません。先に『コースマスタ管理』でコースを登録・有効化してください。")
         return
+
+    # フォームの「バージョン」：成功時だけ +1 して全ウィジェットの key を変える
+    form_version = st.session_state.get("reservation_form_version", 0)
 
     # ======================
     # 予約登録フォーム
     # ======================
     st.markdown("### 新規予約")
 
-    with st.form("reservation_form", clear_on_submit=True):
+    form_key_suffix = f"_v{form_version}"
+
+    # エラー時は入力を残したいので clear_on_submit=False
+    with st.form(f"reservation_form{form_key_suffix}", clear_on_submit=False):
         col1, col2 = st.columns(2)
 
         with col1:
-            selected_course_name = st.selectbox("コースを選択", [c["name"] for c in courses])
+            # コース選択
+            selected_course_name = st.selectbox(
+                "コースを選択",
+                [c["name"] for c in courses],
+                key=f"course_select{form_key_suffix}",
+            )
 
             # ここで course を特定
             course_for_form = next(c for c in courses if c["name"] == selected_course_name)
             selected_course_id = course_for_form["id"]
             has_main = course_has_main_item(selected_course_id)
 
-            guest_name = st.text_input("お名前（必須）", "")
+            guest_name = st.text_input(
+                "お名前（必須）",
+                key=f"guest_name_input{form_key_suffix}",
+            )
 
             guest_count = st.number_input(
                 "人数",
@@ -308,6 +327,7 @@ def show():
                 max_value=20,
                 value=2,
                 step=1,
+                key=f"guest_count_input{form_key_suffix}",
             )
 
             # テーブル番号はプルダウン（必須）
@@ -316,19 +336,30 @@ def show():
                 "テーブル番号（必須）",
                 options=table_select_options,
                 index=0,
+                key=f"table_no_input{form_key_suffix}",
             )
 
         with col2:
-            date_input_val = st.date_input("予約日", value=date.today())
+            date_input_val = st.date_input(
+                "予約日",
+                value=date.today(),
+                key=f"reservation_date{form_key_suffix}",
+            )
 
-            # ---- 予約時間は固定4つ ----
-            time_str = st.selectbox("予約時間", TIME_OPTIONS)
+            time_str = st.selectbox(
+                "予約時間",
+                TIME_OPTIONS,
+                key=f"reservation_time{form_key_suffix}",
+            )
             time_input_val = datetime.strptime(time_str, "%H:%M").time()
 
-            note = st.text_area("メモ（任意）", "")
+            note = st.text_area(
+                "メモ（任意）",
+                key=f"reservation_note{form_key_suffix}",
+            )
 
         # メイン料理の人数入力
-        main_counts = {}  # { "パスタ": 1, "ピザ": 1 } みたいな dict になる想定
+        main_counts = {}
 
         if has_main:
             st.markdown("#### メイン料理の内訳")
@@ -337,26 +368,11 @@ def show():
                 main_counts[name] = st.number_input(
                     f"{name} の人数",
                     min_value=0,
-                    max_value=20,  # 上限はざっくりでOK、後で合計でチェックする
+                    max_value=20,
                     value=0,
                     step=1,
-                    key=f"main_{name}",
+                    key=f"main_{name}{form_key_suffix}",
                 )
-
-        # ここからはフォーム内だが、2つのカラムの「外側」に書く
-        # 選択されたコース名から course_id を特定
-        # course_for_form = next(c for c in courses if c["name"] == selected_course_name)
-        # selected_course_id = course_for_form["id"]
-
-        # # メイン料理プルダウン（そのコースに「メイン」アイテムがある場合のみ表示）
-        # main_choice = None
-        # if course_has_main_item(selected_course_id):
-        #     main_choice = st.selectbox(
-        #         "メイン料理",
-        #         options=MAIN_OPTIONS,
-        #         index=0,
-        #         key="reservation_main_choice",
-        #     )
 
         submitted = st.form_submit_button("予約を登録")
         if submitted:
@@ -374,10 +390,12 @@ def show():
                     guest_count_int = int(guest_count)
 
                     if total_main != guest_count_int:
-                        st.warning(f"メイン料理の人数合計（{total_main}名）が予約人数（{guest_count_int}名）と一致していません。")
+                        st.warning(
+                            f"メイン料理の人数合計（{total_main}名）が"
+                            f"予約人数（{guest_count_int}名）と一致していません。"
+                        )
                         st.stop()
 
-                    # 「パスタ：1、ピザ：2」形式の文字列を作成
                     parts = [
                         f"{name}：{cnt}"
                         for name, cnt in main_counts.items()
@@ -392,13 +410,19 @@ def show():
                     guest_count=int(guest_count),
                     table_no=table_selected,
                     note=note.strip() or None,
-                    main_choice=main_choice_str,  # ← ここがポイント
+                    main_choice=main_choice_str,
                 )
 
                 if ok:
-                    st.success(msg)
+                    # ★ 成功したらバージョンを +1 → 次の描画で key が全部変わるのでフォームが初期化される
+                    st.session_state["reservation_form_version"] = form_version + 1
+                    st.session_state["reservation_success_message"] = msg
+                    st.rerun()
                 else:
+                    # 失敗時は入力を残したままエラー表示
                     st.error(msg)
+
+
 
     # ======================
     # 予約一覧（任意の日付）＋ 編集・削除
