@@ -417,9 +417,16 @@ def show_board():
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    # ★ 種類ごとに別レコードになった main_detail / quantity を優先
+                    detail = p.get("main_detail")
+                    qty = p.get("quantity", 1)
+                    if detail:
+                        display_name = f"{detail}：{qty}"
+                    else:
+                        # 旧データ用フォールバック（main_choice 全体の文字列）
+                        main_choice = resv.get("main_choice")
+                        if main_choice:
+                            display_name = main_choice
 
                 # 商品見出し：時間(赤)＋商品名
                 st.markdown(
@@ -464,6 +471,7 @@ def show_board():
                         "<hr style='margin:8px 0; border:none; border-top:1px solid #333333;'/>",
                         unsafe_allow_html=True
                     )
+
 
 
 
@@ -619,9 +627,15 @@ def show_cooked_list():
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    detail = p.get("main_detail")
+                    qty = p.get("quantity", 1)
+                    if detail:
+                        display_name = f"{detail}：{qty}"
+                    else:
+                        main_choice = resv.get("main_choice")
+                        if main_choice:
+                            display_name = main_choice
+
 
                 st.markdown(
                     f"""
@@ -792,9 +806,15 @@ def show_served_list():
                 # メイン枠なら、予約ごとのメイン料理名で上書き
                 display_name = item["item_name"]
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    detail = p.get("main_detail")
+                    qty = p.get("quantity", 1)
+                    if detail:
+                        display_name = f"{detail}：{qty}"
+                    else:
+                        main_choice = resv.get("main_choice")
+                        if main_choice:
+                            display_name = main_choice
+
 
                 st.markdown(
                     f"""
