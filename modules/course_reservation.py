@@ -160,7 +160,16 @@ def is_slot_conflicted(reserved_at: datetime, table_no: str, exclude_reservation
 
 
 
-def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_count, table_no, note, main_choice=None,):
+def create_reservation_and_progress(
+    course_id,
+    reserved_at,
+    guest_name,
+    guest_count,
+    table_no,
+    note,
+    main_choice=None,
+    main_detail_counts=None,  # ★ 追加: {"パスタ": 1, "ピザ": 1} みたいな dict
+):
     # 1. 同じ時間・同じテーブルに予約がないか確認
     if is_slot_conflicted(reserved_at, table_no):
         return False, "この時間帯は同じテーブルに別の予約が入っているため、登録できません。"
@@ -174,7 +183,7 @@ def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_co
         "table_no": table_no,               # 必須（プルダウン）
         "status": "reserved",
         "note": note or None,
-        "main_choice": main_choice, 
+        "main_choice": main_choice,
     }
     try:
         res = supabase.table("course_reservations").insert(reservation_data).execute()
@@ -193,15 +202,35 @@ def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_co
     progress_rows = []
     for item in items:
         scheduled_time = reserved_at + timedelta(minutes=int(item["offset_minutes"]))
-        progress_rows.append(
-            {
-                "reservation_id": reservation_id,
-                "course_item_id": item["id"],
-                "scheduled_time": scheduled_time.isoformat(),
-                "is_cooked": False,
-                "is_served": False,
-            }
-        )
+
+        if item["item_name"] == "メイン" and main_detail_counts:
+            # ★ メインは種類ごとに別レコードで作成
+            for name, cnt in main_detail_counts.items():
+                if cnt <= 0:
+                    continue
+                progress_rows.append(
+                    {
+                        "reservation_id": reservation_id,
+                        "course_item_id": item["id"],
+                        "scheduled_time": scheduled_time.isoformat(),
+                        "is_cooked": False,
+                        "is_served": False,
+                        "main_detail": name,       # パスタ / ピザ
+                        "quantity": int(cnt),      # 皿数
+                    }
+                )
+        else:
+            # メイン以外は従来どおり 1レコード
+            progress_rows.append(
+                {
+                    "reservation_id": reservation_id,
+                    "course_item_id": item["id"],
+                    "scheduled_time": scheduled_time.isoformat(),
+                    "is_cooked": False,
+                    "is_served": False,
+                    "quantity": 1,              # 新カラム（デフォルト1）
+                }
+            )
 
     try:
         supabase.table("course_progress").insert(progress_rows).execute()
@@ -209,6 +238,7 @@ def create_reservation_and_progress(course_id, reserved_at, guest_name, guest_co
         return False, f"予約は登録しましたが、進行テーブルの作成に失敗しました: {e}"
 
     return True, "予約とコース進行を登録しました。"
+
 
 
 def fetch_reservations_for_date(target_date: date):
@@ -237,10 +267,20 @@ def fetch_reservations_for_date(target_date: date):
 
 
 
-def update_reservation_basic(reservation_id: str, guest_name: str, guest_count: int, table_no: str, status: str, note: str, reserved_at: datetime, main_choice: Optional[str]):
+def update_reservation_basic(
+    reservation_id: str,
+    guest_name: str,
+    guest_count: int,
+    table_no: str,
+    status: str,
+    note: str,
+    reserved_at: datetime,
+    main_choice: Optional[str],
+):
     """
     予約の基本情報を更新（コースと日時は今回は編集対象外）。
     同じ時間×テーブルの重複チェックも行う。
+    メイン人数が変更された場合は、メインの商品進行も作り直す。
     """
     # 同じ時間・テーブルの重複チェック（自分自身は除外）
     if is_slot_conflicted(reserved_at, table_no, exclude_reservation_id=reservation_id):
@@ -252,14 +292,75 @@ def update_reservation_basic(reservation_id: str, guest_name: str, guest_count: 
         "table_no": table_no,
         "status": status,
         "note": note or None,
-        "main_choice": main_choice, 
+        "main_choice": main_choice,
     }
 
     try:
         supabase.table("course_reservations").update(update_data).eq("id", reservation_id).execute()
-        return True, "予約情報を更新しました。"
     except Exception as e:
         return False, f"予約情報の更新に失敗しました: {e}"
+
+    # ★ メインの内訳を course_progress にも反映
+    try:
+        # この予約の course_id を取得
+        res = (
+            supabase.table("course_reservations")
+            .select("course_id")
+            .eq("id", reservation_id)
+            .single()
+            .execute()
+        )
+        course_id = res.data["course_id"]
+
+        if course_has_main_item(course_id):
+            # メイン用の course_item 一覧
+            res_items = (
+                supabase.table("course_items")
+                .select("id, offset_minutes, item_name")
+                .eq("course_id", course_id)
+                .eq("item_name", "メイン")
+                .execute()
+            )
+            main_items = res_items.data or []
+            main_item_ids = [i["id"] for i in main_items]
+
+            if main_item_ids:
+                # 既存のメイン progress を削除
+                supabase.table("course_progress").delete() \
+                    .eq("reservation_id", reservation_id) \
+                    .in_("course_item_id", main_item_ids) \
+                    .execute()
+
+                # main_choice から人数 dict を再生成
+                counts = parse_main_choice_to_counts(main_choice) if main_choice else {}
+
+                if counts:
+                    progress_rows = []
+                    for item in main_items:
+                        scheduled_time = reserved_at + timedelta(minutes=int(item["offset_minutes"]))
+                        for name, cnt in counts.items():
+                            if cnt <= 0:
+                                continue
+                            progress_rows.append(
+                                {
+                                    "reservation_id": reservation_id,
+                                    "course_item_id": item["id"],
+                                    "scheduled_time": scheduled_time.isoformat(),
+                                    "is_cooked": False,
+                                    "is_served": False,
+                                    "main_detail": name,
+                                    "quantity": int(cnt),
+                                }
+                            )
+                    if progress_rows:
+                        supabase.table("course_progress").insert(progress_rows).execute()
+
+    except Exception as e:
+        # 予約自体は更新できているので、ここは警告に留める
+        st.warning(f"メイン料理の進行データ更新に失敗しました: {e}")
+
+    return True, "予約情報を更新しました。"
+
 
 
 def delete_reservation(reservation_id: str):
@@ -410,8 +511,10 @@ def show():
                     guest_count=int(guest_count),
                     table_no=table_selected,
                     note=note.strip() or None,
-                    main_choice=main_choice_str,
+                    main_choice=main_choice_str,              # 文字列
+                    main_detail_counts=main_counts if has_main else None,  # ★ 追加
                 )
+
 
                 if ok:
                     # ★ 成功したらバージョンを +1 → 次の描画で key が全部変わるのでフォームが初期化される
