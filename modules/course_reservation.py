@@ -170,6 +170,7 @@ def create_reservation_and_progress(
     note,
     main_choice=None,
     main_detail_counts=None,  # ★ 追加: {"パスタ": 1, "ピザ": 1} みたいな dict
+    is_birthday=False,
 ):
     # 1. 同じ時間・同じテーブルに予約がないか確認
     if is_slot_conflicted(reserved_at, table_no):
@@ -185,6 +186,7 @@ def create_reservation_and_progress(
         "status": "reserved",
         "note": note or None,
         "main_choice": main_choice,
+        "is_birthday": is_birthday,
     }
     try:
         res = supabase.table("course_reservations").insert(reservation_data).execute()
@@ -248,7 +250,7 @@ def fetch_reservations_for_date(target_date: date):
 
     res = (
         supabase.table("course_reservations")
-        .select("id, reserved_at, guest_name, guest_count, table_no, status, note, course_id, main_choice")
+        .select("id, reserved_at, guest_name, guest_count, table_no, status, note, course_id, main_choice, is_birthday")
         .gte("reserved_at", start_dt.isoformat())
         .lt("reserved_at", end_dt.isoformat())
         .order("reserved_at", desc=False)  # 時間でざっくりソート
@@ -277,6 +279,7 @@ def update_reservation_basic(
     note: str,
     reserved_at: datetime,
     main_choice: Optional[str],
+    is_birthday: bool,
 ):
     """
     予約の基本情報を更新（コースと日時は今回は編集対象外）。
@@ -294,6 +297,7 @@ def update_reservation_basic(
         "status": status,
         "note": note or None,
         "main_choice": main_choice,
+        "is_birthday": is_birthday,
     }
 
     try:
@@ -432,6 +436,13 @@ def show():
                 key=f"guest_count_input{form_key_suffix}",
             )
 
+            # ★ バースデー利用フラグ
+            is_birthday = st.checkbox(
+                "バースデー利用",
+                value=False,
+                key=f"is_birthday_input{form_key_suffix}",
+            )
+
             # テーブル番号はプルダウン（必須）
             table_select_options = ["テーブルを選択してください"] + TABLE_OPTIONS
             table_selected = st.selectbox(
@@ -514,6 +525,7 @@ def show():
                     note=note.strip() or None,
                     main_choice=main_choice_str,              # 文字列
                     main_detail_counts=main_counts if has_main else None,  # ★ 追加
+                    is_birthday=is_birthday,
                 )
 
 
@@ -653,6 +665,14 @@ def show():
                         key=f"note_{r['id']}",
                     )
 
+                    # ★ バースデー利用フラグ（編集用）
+                    is_birthday_current = bool(r.get("is_birthday"))
+                    is_birthday_edit = st.checkbox(
+                        "バースデー利用",
+                        value=is_birthday_current,
+                        key=f"is_birthday_{r['id']}",
+                    )
+
                     # この予約のコースに「メイン」アイテムがあるかどうか
                     has_main_for_row = course_has_main_item(r["course_id"])
 
@@ -715,6 +735,7 @@ def show():
                             note=note_edit.strip(),
                             reserved_at=res_time,
                             main_choice=main_choice_edit,
+                            is_birthday=is_birthday_edit,
                         )
                         if ok:
                             st.success(msg)
