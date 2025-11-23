@@ -53,7 +53,6 @@ def cleanup_old_data():
         st.error(f"過去データの削除に失敗しました: {e}")
 
 
-
 def parse_dt(dt_str: str):
     """Supabase の TIMESTAMP(+タイムゾーン) を安全に datetime に変換する"""
     if not dt_str:
@@ -68,7 +67,8 @@ def parse_dt(dt_str: str):
         if len(base) > 19:
             base = base[:19]  # "YYYY-MM-DDTHH:MM:SS" まで
         return datetime.fromisoformat(base)
-    
+
+
 def to_jst(dt: Optional[datetime]):
     """
     UTC の datetime を JST(+9h) に変換して返す。
@@ -79,7 +79,6 @@ def to_jst(dt: Optional[datetime]):
     return dt + timedelta(hours=9)
 
 
-
 # 予約ステータスを更新（reserved / arrived など）
 def set_reservation_status(reservation_id: str, status: str):
     try:
@@ -88,6 +87,7 @@ def set_reservation_status(reservation_id: str, status: str):
         ).eq("id", reservation_id).execute()
     except Exception as e:
         st.error(f"予約ステータスの更新に失敗しました: {e}")
+
 
 # 調理フラグを更新（True / False）
 def set_cooked_flag(progress_id: str, flag: bool):
@@ -123,7 +123,6 @@ def set_served_flag(progress_id: str, flag: bool):
         st.error(f"配膳フラグの更新に失敗しました: {e}")
 
 
-
 def fetch_reservations_for_date(target_date: date):
     start_dt = datetime.combine(target_date, time(0, 0, 0))
     end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0, 0))
@@ -154,14 +153,13 @@ def fetch_progress_for_reservations(reservation_ids):
     return res.data or []
 
 
-
 def fetch_items_for_ids(item_ids):
     if not item_ids:
         return {}
 
     res = (
         supabase.table("course_items")
-        .select("id, item_name, offset_minutes")
+        .select("id, item_name, offset_minutes, course_id, display_order")
         .in_("id", item_ids)
         .execute()
     )
@@ -186,6 +184,38 @@ def update_cooked(progress_id):
 def update_served(progress_id):
     # 既存コードとの互換用ヘルパー（配膳済みにする）
     set_served_flag(progress_id, True)
+
+
+def build_last_item_map(item_map: dict) -> dict:
+    """
+    course_id ごとに「コースの最後の course_item_id」を返すマップを作る。
+    display_order が最大のものを「最後」とみなす。
+    """
+    last_item_by_course = {}
+
+    for item_id, item in item_map.items():
+        course_id = item.get("course_id")
+        if not course_id:
+            continue
+
+        # display_order が None / 文字列 でも動くように整数化
+        try:
+            order = int(item.get("display_order") or 0)
+        except (TypeError, ValueError):
+            order = 0
+
+        current = last_item_by_course.get(course_id)
+        if current is None:
+            last_item_by_course[course_id] = item_id
+        else:
+            try:
+                current_order = int(item_map[current].get("display_order") or 0)
+            except (TypeError, ValueError):
+                current_order = 0
+            if order > current_order:
+                last_item_by_course[course_id] = item_id
+
+    return last_item_by_course
 
 
 def show_board():
@@ -217,7 +247,7 @@ def show_board():
     if not reservations:
         st.info("該当日のコース予約はありません。")
         return
-    
+
     # 時間 → テーブル順で並べ替え
     def sort_key_resv(r):
         dt = datetime.fromisoformat(r["reserved_at"])
@@ -241,57 +271,6 @@ def show_board():
     </style>
     """, unsafe_allow_html=True)
 
-    # # ======================
-    # # 予約件数 + 時間帯別 + コース別の集計表示
-    # # ======================
-
-    # # 総件数
-    # total_count = len(reservations)
-
-    # # 時間帯ごとの件数
-    # time_counter = Counter()
-    # for r in reservations:
-    #     dt = datetime.fromisoformat(r["reserved_at"])
-    #     time_str = dt.strftime("%H:%M")
-    #     if time_str in TIME_OPTIONS:
-    #         time_counter[time_str] += 1
-
-    # # コース情報取得（id → name）
-    # res_courses = (
-    #     supabase.table("course_master")
-    #     .select("id, name")
-    #     .execute()
-    # )
-    # course_rows = res_courses.data or []
-    # course_map = {c["id"]: c["name"] for c in course_rows}
-
-    # # コース別件数
-    # course_counter = Counter()
-    # for r in reservations:
-    #     cid = r.get("course_id")
-    #     if cid:
-    #         course_counter[cid] += 1
-
-    # # 表示（予約登録画面と同じフォーマット）
-    # st.markdown(
-    #     f"#### {target_date.strftime('%Y/%m/%d')} の予約件数：**{total_count}件**"
-    # )
-
-    # # 時間帯別
-    # time_lines = []
-    # for slot in TIME_OPTIONS:  # ["18:00", "18:30", "20:30", "21:00"]
-    #     count = time_counter.get(slot, 0)
-    #     time_lines.append(f"{slot}: {count}件")
-    # st.caption("時間帯別：" + " / ".join(time_lines))
-
-    # # コース別
-    # course_lines = []
-    # for cid, cnt in course_counter.items():
-    #     name = course_map.get(cid, "不明なコース")
-    #     course_lines.append(f"{name}: {cnt}件")
-    # if course_lines:
-    #     st.caption("コース別：" + " / ".join(course_lines))
-
     # ===== ここからボード表示のための progress 集計 =====
     reservation_ids = [r["id"] for r in reservations]
     progress_rows = fetch_progress_for_reservations(reservation_ids)
@@ -299,6 +278,9 @@ def show_board():
     # item_id → item 情報
     item_ids = list({p["course_item_id"] for p in progress_rows})
     item_map = fetch_items_for_ids(item_ids)
+
+    # ★ コースごとの「最後の course_item_id 」マップ
+    last_item_by_course = build_last_item_map(item_map)
 
     # 予約ごとの progress 集計
     #   has_any_progress: 何か1つでも商品が存在する予約
@@ -353,6 +335,9 @@ def show_board():
                 progress_by_res.get(resv_id, []),
                 key=lambda x: x["scheduled_time"],
             )
+
+            # ★ この予約がバースデー利用かどうか
+            is_birthday = bool(resv.get("is_birthday"))
 
             # ===== 見出し：時間 / 名前＋人数 / テーブル =====
             guest_name = (resv.get("guest_name") or "お名前未入力")
@@ -425,21 +410,29 @@ def show_board():
                 is_cooked = p.get("is_cooked", False)
                 is_served = p.get("is_served", False)  # ここは全部 False のはずだが念のため
 
-                # メイン枠なら、予約ごとのメイン料理名で上書き
-                display_name = item["item_name"]
-                if item["item_name"] == "メイン":
-                    # ★ 種類ごとに別レコードになった main_detail / quantity を優先
-                    detail = p.get("main_detail")
-                    qty = p.get("quantity", 1)
-                    if detail:
-                        display_name = f"{detail}：{qty}"
-                    else:
-                        # 旧データ用フォールバック（main_choice 全体の文字列）
-                        main_choice = resv.get("main_choice")
-                        if main_choice:
-                            display_name = main_choice
+                # ★ メイン詳細＆数量を反映（quantity / main_detail カラム対応）
+                detail = p.get("main_detail")          # 例: "パスタ" / "ピザ" / None
+                qty = p.get("quantity", 1)
 
-                # 商品見出し：時間(赤)＋商品名
+                if item["item_name"] == "メイン":
+                    base_name = detail or "メイン"
+                else:
+                    base_name = item["item_name"]
+
+                if qty and qty > 1:
+                    display_name = f"{base_name} ：{qty}"
+                else:
+                    display_name = base_name
+
+                # ★ HBD ラベル（バースデー＋「コースの最後の course_item」のときだけ付ける）
+                hbd_prefix = ""
+                course_id = resv.get("course_id")
+                if is_birthday and course_id:
+                    hbd_item_id = last_item_by_course.get(course_id)
+                    if hbd_item_id and (p["course_item_id"] == hbd_item_id):
+                        hbd_prefix = '<span style="color:#d9534f; font-weight:700; margin-right:4px;">【HBD】</span>'
+
+                # 商品見出し：時間(赤)＋商品名（＋必要ならHBD）
                 st.markdown(
                     f"""
                     <div style="margin-top:4px; margin-bottom:4px;">
@@ -447,7 +440,7 @@ def show_board():
                             <span style="color:#d9534f; font-weight:700; margin-right:4px;">
                                 {time_str}
                             </span>
-                            <span>{display_name}</span>
+                            <span>{hbd_prefix}{display_name}</span>
                         </div>
                         <div style="font-size:16px; color:#6495ED; margin-left:2px; font-weight:bold;">
                             テーブル：{resv.get('table_no') or '-'}
@@ -482,11 +475,6 @@ def show_board():
                         "<hr style='margin:8px 0; border:none; border-top:1px solid #333333;'/>",
                         unsafe_allow_html=True
                     )
-
-
-
-
-
 
 
 # ===== 調理済み・配膳済み一覧 =====
@@ -532,10 +520,10 @@ def show_cooked_list():
     reservation_ids = list({r["reservation_id"] for r in rows})
     item_ids = list({r["course_item_id"] for r in rows})
 
-    # 予約情報
+    # 予約情報（★ course_id, is_birthday を追加で取得）
     res_resv = (
         supabase.table("course_reservations")
-        .select("id, reserved_at, guest_name, guest_count, table_no, main_choice")
+        .select("id, reserved_at, guest_name, guest_count, table_no, main_choice, course_id, is_birthday")
         .in_("id", reservation_ids)
         .execute()
     )
@@ -546,6 +534,9 @@ def show_cooked_list():
 
     # 商品マスタ
     item_map = fetch_items_for_ids(item_ids)
+
+    # ★ コースごとの「最後の course_item_id 」マップ
+    last_item_by_course = build_last_item_map(item_map)
 
     # 予約ごとに progress をまとめる
     progress_by_res = {}
@@ -616,7 +607,6 @@ def show_cooked_list():
                 unsafe_allow_html=True
             )
 
-
             items_for_res = sorted(
                 progress_by_res.get(resv["id"], []),
                 key=lambda x: x["scheduled_time"],
@@ -636,14 +626,30 @@ def show_cooked_list():
                 cooked_at = parse_dt(p["cooked_at"])
                 cooked_at_jst = to_jst(cooked_at)
 
-                # メイン枠なら、予約ごとのメイン料理名で上書き
-                display_name = item["item_name"]
-                if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                # ★ メイン詳細（main_detail）＆数量(quantity)に対応
+                detail = p.get("main_detail")
+                qty = p.get("quantity", 1)
 
-                # 安全のため None チェック
+                if item["item_name"] == "メイン":
+                    base_name = detail or "メイン"
+                else:
+                    base_name = item["item_name"]
+
+                # 数量が2以上なら ×で表示
+                if qty and qty > 1:
+                    display_name = f"{base_name} ×{qty}"
+                else:
+                    display_name = base_name
+
+                # ★ HBD（バースデー＋コース最後の商品にだけ付ける）
+                course_id = resv.get("course_id")
+                is_birthday = bool(resv.get("is_birthday"))
+                if is_birthday and course_id:
+                    hbd_item_id = last_item_by_course.get(course_id)
+                    if hbd_item_id and (p["course_item_id"] == hbd_item_id):
+                        display_name = f"【HBD】{display_name}"
+
+                # 時間表示
                 time_label = cooked_at_jst.strftime('%H:%M') if cooked_at_jst else "--:--"
 
                 st.markdown(
@@ -660,14 +666,12 @@ def show_cooked_list():
                     unsafe_allow_html=True
                 )
 
-
                 # 区切り線
                 if row_idx < total_items - 1:
                     st.markdown(
                         "<hr style='margin:8px 0; border:none; border-top:1px solid #333333;'/>",
                         unsafe_allow_html=True
                     )
-
 
 
 def show_served_list():
@@ -711,10 +715,10 @@ def show_served_list():
     reservation_ids = list({r["reservation_id"] for r in rows})
     item_ids = list({r["course_item_id"] for r in rows})
 
-    # 予約情報
+    # 予約情報（★ course_id, is_birthday を追加で取得）
     res_resv = (
         supabase.table("course_reservations")
-        .select("id, reserved_at, guest_name, guest_count, table_no, main_choice")
+        .select("id, reserved_at, guest_name, guest_count, table_no, main_choice, course_id, is_birthday")
         .in_("id", reservation_ids)
         .execute()
     )
@@ -725,6 +729,9 @@ def show_served_list():
 
     # 商品マスタ
     item_map = fetch_items_for_ids(item_ids)
+
+    # ★ コースごとの「最後の course_item_id 」マップ
+    last_item_by_course = build_last_item_map(item_map)
 
     # 予約ごとに progress をまとめる
     progress_by_res = {}
@@ -814,12 +821,27 @@ def show_served_list():
                 served_at = parse_dt(p["served_at"])
                 served_at_jst = to_jst(served_at)
 
-                # メイン枠なら、予約ごとのメイン料理名で上書き
-                display_name = item["item_name"]
+                # ★ メイン詳細（main_detail）＆数量(quantity)に対応
+                detail = p.get("main_detail")
+                qty = p.get("quantity", 1)
+
                 if item["item_name"] == "メイン":
-                    main_choice = resv.get("main_choice")
-                    if main_choice:
-                        display_name = main_choice
+                    base_name = detail or "メイン"
+                else:
+                    base_name = item["item_name"]
+
+                if qty and qty > 1:
+                    display_name = f"{base_name} ×{qty}"
+                else:
+                    display_name = base_name
+
+                # ★ HBD（バースデー＋コース最後の商品にだけ付ける）
+                course_id = resv.get("course_id")
+                is_birthday = bool(resv.get("is_birthday"))
+                if is_birthday and course_id:
+                    hbd_item_id = last_item_by_course.get(course_id)
+                    if hbd_item_id and (p["course_item_id"] == hbd_item_id):
+                        display_name = f"【HBD】{display_name}"
 
                 time_label = served_at_jst.strftime('%H:%M') if served_at_jst else "--:--"
 
@@ -837,7 +859,6 @@ def show_served_list():
                     unsafe_allow_html=True
                 )
 
-
                 # ★ここで「配膳済みを戻す」ボタン（→ 進行ボードへ戻す）
                 if st.button(
                     "配膳済みを戻す",
@@ -852,4 +873,3 @@ def show_served_list():
                         "<hr style='margin:8px 0; border:none; border-top:1px solid #333333;'/>",
                         unsafe_allow_html=True
                     )
-
