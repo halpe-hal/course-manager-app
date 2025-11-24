@@ -1,7 +1,7 @@
 # modules/course_progress_view.py
 
 import streamlit as st
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone  # ← ここで timezone も追加
 from collections import Counter
 from streamlit_autorefresh import st_autorefresh
 from typing import Optional
@@ -71,11 +71,18 @@ def parse_dt(dt_str: str):
 
 def to_jst(dt: Optional[datetime]):
     """
-    UTC の datetime を JST(+9h) に変換して返す。
+    UTC or tz-aware の datetime を JST(+9h) の「naive datetime」に変換して返す。
     None の場合はそのまま None。
     """
     if dt is None:
         return None
+
+    # tz情報付きなら、一旦JSTに変換してから tzinfo を外す
+    if dt.tzinfo is not None:
+        jst = dt.astimezone(timezone(timedelta(hours=9)))
+        return jst.replace(tzinfo=None)
+
+    # tz情報なしなら、素直に +9時間
     return dt + timedelta(hours=9)
 
 
@@ -404,11 +411,25 @@ def show_board():
                 if not item:
                     continue
 
-                sched_time = datetime.fromisoformat(p["scheduled_time"])
+                # ★ scheduled_time を取得（タイムゾーン付きなら tzinfo を剥がして naive に統一）
+                raw_sched = datetime.fromisoformat(p["scheduled_time"])
+                if raw_sched.tzinfo is not None:
+                    sched_time = raw_sched.replace(tzinfo=None)
+                else:
+                    sched_time = raw_sched
                 time_str = sched_time.strftime('%H:%M')
 
                 is_cooked = p.get("is_cooked", False)
                 is_served = p.get("is_served", False)  # ここは全部 False のはずだが念のため
+
+                # ★ 予定時刻から3分以上たっても未配膳なら「遅延」判定
+                now_dt = datetime.now()
+                is_overdue = (not is_served) and ((now_dt - sched_time) >= timedelta(minutes=3))
+
+                # コンテナのスタイル（遅延時は薄赤背景＋角丸＋パディング）
+                container_style = "margin-top:4px; margin-bottom:4px;"
+                if is_overdue:
+                    container_style += " background-color:#ffe5e5; border-radius:8px; padding:4px 6px;"
 
                 # ★ メイン詳細＆数量を反映（quantity / main_detail カラム対応）
                 detail = p.get("main_detail")          # 例: "パスタ" / "ピザ" / None
