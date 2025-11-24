@@ -456,7 +456,7 @@ def show_board():
                 # 商品見出し：時間(赤)＋商品名（＋必要ならHBD）
                 st.markdown(
                     f"""
-                    <div style="margin-top:4px; margin-bottom:4px;">
+                    <div style="{container_style}">
                         <div style="font-size:16px; font-weight:600;">
                             <span style="color:#d9534f; font-weight:700; margin-right:4px;">
                                 {time_str}
