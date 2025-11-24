@@ -532,11 +532,26 @@ def show_cooked_list():
         st.info("該当する予約データがありません。")
         return
 
-    # 商品マスタ
+    # 商品マスタ（この日に調理済みの item）
     item_map = fetch_items_for_ids(item_ids)
 
-    # ★ コースごとの「最後の course_item_id 」マップ
-    last_item_by_course = build_last_item_map(item_map)
+    # ===== HBD 判定用：コースごとの「本当の最後の course_item」を取得する =====
+    course_ids = list({r.get("course_id") for r in reservations if r.get("course_id")})
+
+    if course_ids:
+        res_items_full = (
+            supabase.table("course_items")
+            .select("id, item_name, offset_minutes, course_id, display_order")
+            .in_("course_id", course_ids)
+            .execute()
+        )
+        full_items = res_items_full.data or []
+        full_item_map = {i["id"]: i for i in full_items}
+
+        # ★ コースごとの「本当の最後の course_item_id 」マップ
+        last_item_by_course = build_last_item_map(full_item_map)
+    else:
+        last_item_by_course = {}
 
     # 予約ごとに progress をまとめる
     progress_by_res = {}
@@ -641,7 +656,7 @@ def show_cooked_list():
                 else:
                     display_name = base_name
 
-                # ★ HBD（バースデー＋コース最後の商品にだけ付ける）
+                # ★ HBD（バースデー＋「コース本来の最後の商品」にだけ付ける）
                 course_id = resv.get("course_id")
                 is_birthday = bool(resv.get("is_birthday"))
                 if is_birthday and course_id:
@@ -672,6 +687,7 @@ def show_cooked_list():
                         "<hr style='margin:8px 0; border:none; border-top:1px solid #333333;'/>",
                         unsafe_allow_html=True
                     )
+
 
 
 def show_served_list():
@@ -727,11 +743,26 @@ def show_served_list():
         st.info("該当する予約データがありません。")
         return
 
-    # 商品マスタ
+    # 商品マスタ（この日に配膳済みの item）
     item_map = fetch_items_for_ids(item_ids)
 
-    # ★ コースごとの「最後の course_item_id 」マップ
-    last_item_by_course = build_last_item_map(item_map)
+    # ===== HBD 判定用：コースごとの「本当の最後の course_item」を取得する =====
+    course_ids = list({r.get("course_id") for r in reservations if r.get("course_id")})
+
+    if course_ids:
+        res_items_full = (
+            supabase.table("course_items")
+            .select("id, item_name, offset_minutes, course_id, display_order")
+            .in_("course_id", course_ids)
+            .execute()
+        )
+        full_items = res_items_full.data or []
+        full_item_map = {i["id"]: i for i in full_items}
+
+        # ★ コースごとの「本当の最後の course_item_id 」マップ
+        last_item_by_course = build_last_item_map(full_item_map)
+    else:
+        last_item_by_course = {}
 
     # 予約ごとに progress をまとめる
     progress_by_res = {}
@@ -835,7 +866,7 @@ def show_served_list():
                 else:
                     display_name = base_name
 
-                # ★ HBD（バースデー＋コース最後の商品にだけ付ける）
+                # ★ HBD（バースデー＋「コース本来の最後の商品」にだけ付ける）
                 course_id = resv.get("course_id")
                 is_birthday = bool(resv.get("is_birthday"))
                 if is_birthday and course_id:
@@ -859,7 +890,7 @@ def show_served_list():
                     unsafe_allow_html=True
                 )
 
-                # ★ここで「配膳済みを戻す」ボタン（→ 進行ボードへ戻す）
+                # 「配膳済みを戻す」ボタン（→ 進行ボードへ戻す）
                 if st.button(
                     "配膳済みを戻す",
                     key=f"undo_served_{idx}_{row_idx}_{p['id']}",
