@@ -70,20 +70,16 @@ def parse_dt(dt_str: str):
 
 
 def to_jst(dt: Optional[datetime]):
-    """
-    UTC or tz-aware の datetime を JST(+9h) の「naive datetime」に変換して返す。
-    None の場合はそのまま None。
-    """
     if dt is None:
         return None
+    # tzinfoが付いていない（naive）の場合、UTC扱いで tzinfo を付ける
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    # JST に変換して naive に戻す
+    return dt.astimezone(timezone(timedelta(hours=9))).replace(tzinfo=None)
 
-    # tz情報付きなら、一旦JSTに変換してから tzinfo を外す
-    if dt.tzinfo is not None:
-        jst = dt.astimezone(timezone(timedelta(hours=9)))
-        return jst.replace(tzinfo=None)
-
-    # tz情報なしなら、素直に +9時間
-    return dt + timedelta(hours=9)
+def get_now_jst():
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
 
 # 予約ステータスを更新（reserved / arrived など）
@@ -103,7 +99,7 @@ def set_cooked_flag(progress_id: str, flag: bool):
 
         if flag:
             # 調理済みにするときは cooked_at も現在時刻でセット
-            payload["cooked_at"] = datetime.now().isoformat()
+            payload["cooked_at"] = datetime.now(timezone.utc).isoformat()
         else:
             # 戻すときは cooked_at をクリア
             payload["cooked_at"] = None
@@ -120,7 +116,7 @@ def set_served_flag(progress_id: str, flag: bool):
 
         if flag:
             # 配膳済みにするときは served_at も現在時刻でセット
-            payload["served_at"] = datetime.now().isoformat()
+            payload["served_at"] = datetime.now(timezone.utc).isoformat()
         else:
             # 戻すときは served_at をクリア
             payload["served_at"] = None
@@ -175,14 +171,14 @@ def fetch_items_for_ids(item_ids):
 
 
 def update_reservation_arrived(reservation_id):
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     supabase.table("course_reservations").update(
         {"status": "arrived", "arrived_at": now_iso}
     ).eq("id", reservation_id).execute()
 
 
 def update_cooked(progress_id):
-    now_iso = datetime.now().isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
     supabase.table("course_progress").update(
         {"is_cooked": True, "cooked_at": now_iso}
     ).eq("id", progress_id).execute()
@@ -411,19 +407,22 @@ def show_board():
                 if not item:
                     continue
 
-                # ★ scheduled_time を取得（タイムゾーン付きなら tzinfo を剥がして naive に統一）
                 raw_sched = datetime.fromisoformat(p["scheduled_time"])
-                if raw_sched.tzinfo is not None:
-                    sched_time = raw_sched.replace(tzinfo=None)
-                else:
-                    sched_time = raw_sched
+
+                # tzinfo が無い（naive）なら UTC とみなす
+                if raw_sched.tzinfo is None:
+                    raw_sched = raw_sched.replace(tzinfo=timezone.utc)
+
+                # JST に変換して naive に戻す
+                sched_time = raw_sched.astimezone(timezone(timedelta(hours=9))).replace(tzinfo=None)
+
                 time_str = sched_time.strftime('%H:%M')
 
                 is_cooked = p.get("is_cooked", False)
                 is_served = p.get("is_served", False)  # ここは全部 False のはずだが念のため
 
                 # ★ 予定時刻から3分以上たっても未配膳なら「遅延」判定
-                now_dt = datetime.now()
+                now_dt = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).replace(tzinfo=None)
                 is_overdue = (not is_served) and ((now_dt - sched_time) >= timedelta(minutes=3))
 
                 # コンテナのスタイル（遅延時は薄赤背景＋角丸＋パディング）
@@ -479,10 +478,25 @@ def show_board():
                             set_cooked_flag(p["id"], True)
                             st.rerun()
                     else:
-                        st.error("調理済み")
+                        st.markdown(
+                            """
+                            <div style="
+                                background-color:#e6f3ff;
+                                color:#004a99;
+                                padding:12px 20px;
+                                border-radius:6px;
+                                font-weight:600;
+                                width:fit-content;
+                            ">
+                                調理済み
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
                         if st.button("調理済みを戻す", key=f"undo_cook_{idx}_{row_idx}_{p['id']}"):
                             set_cooked_flag(p["id"], False)
                             st.rerun()
+
 
                 with c2:
                     if not is_served:
