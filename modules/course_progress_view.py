@@ -221,6 +221,31 @@ def build_last_item_map(item_map: dict) -> dict:
     return last_item_by_course
 
 
+def parse_local_scheduled_time(dt_str: str) -> Optional[datetime]:
+    """
+    course_progress.scheduled_time を
+    「タイムゾーン無視のローカル時刻」として解釈するためのパーサー。
+
+    例:
+      "2025-11-24T18:10:00+00:00" → 2025-11-24 18:10:00
+      "2025-11-24T18:10:00+09:00" → 2025-11-24 18:10:00
+      "2025-11-24T18:10:00Z"      → 2025-11-24 18:10:00
+      "2025-11-24T18:10:00"       → 2025-11-24 18:10:00
+    """
+    if not dt_str:
+        return None
+
+    # タイムゾーン部分を落とす
+    base = dt_str.split("Z")[0].split("+")[0]
+
+    # "YYYY-MM-DDTHH:MM:SS" までに揃える
+    if len(base) > 19:
+        base = base[:19]
+
+    return datetime.fromisoformat(base)
+
+
+
 def show_board():
     cleanup_old_data()
 
@@ -407,14 +432,10 @@ def show_board():
                 if not item:
                     continue
 
-                raw_sched = datetime.fromisoformat(p["scheduled_time"])
-
-                # tzinfo が無い（naive）なら UTC とみなす
-                if raw_sched.tzinfo is None:
-                    raw_sched = raw_sched.replace(tzinfo=timezone.utc)
-
-                # JST に変換して naive に戻す
-                sched_time = raw_sched.astimezone(timezone(timedelta(hours=9))).replace(tzinfo=None)
+                # ★ scheduled_time は「ローカル時刻そのもの」として扱う
+                sched_time = parse_local_scheduled_time(p["scheduled_time"])
+                if sched_time is None:
+                    continue
 
                 time_str = sched_time.strftime('%H:%M')
 
@@ -422,7 +443,8 @@ def show_board():
                 is_served = p.get("is_served", False)  # ここは全部 False のはずだが念のため
 
                 # ★ 予定時刻から3分以上たっても未配膳なら「遅延」判定
-                now_dt = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).replace(tzinfo=None)
+                # ★ 予定時刻から3分以上たっても未配膳なら「遅延」判定
+                now_dt = get_now_jst().replace(tzinfo=None)  # JST 現在時刻（naive）
                 is_overdue = (not is_served) and ((now_dt - sched_time) >= timedelta(minutes=3))
 
                 # コンテナのスタイル（遅延時は薄赤背景＋角丸＋パディング）
