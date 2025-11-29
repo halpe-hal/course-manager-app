@@ -4,8 +4,11 @@ import streamlit as st
 from datetime import datetime, date, time, timedelta
 from collections import Counter
 from .supabase_client import supabase
-from typing import Optional
+from typing import Optional, Tuple
 from .time_utils import get_today_jst
+
+import pandas as pd
+import re
 
 # テーブル番号の選択肢
 TABLE_OPTIONS = [
@@ -27,6 +30,10 @@ MAIN_OPTIONS = [
     "ピザ",
 ]
 
+
+# =========================
+# メイン内訳系ヘルパー
+# =========================
 def parse_main_choice_to_counts(main_choice: Optional[str]):
     """
     'パスタ：1、ピザ：2' のような文字列を
@@ -70,6 +77,106 @@ def counts_to_main_choice(counts) -> Optional[str]:
     return "、".join(parts) if parts else None
 
 
+def _default_main_distribution(guest_count: int):
+    """
+    パスタ/ピザのデフォルト配分。
+    2名予約は1つずつ、3名予約はパスタ1・ピザ2、4名予約はパスタ2・ピザ2、
+    5名予約はパスタ3・ピザ2、それ以外はざっくり半分。
+    """
+    if guest_count <= 0:
+        return 0, 0
+    if guest_count == 1:
+        return 1, 0
+    if guest_count == 2:
+        return 1, 1
+    if guest_count == 3:
+        return 1, 2
+    if guest_count == 4:
+        return 2, 2
+    if guest_count == 5:
+        return 3, 2
+
+    # 6名以上はざっくり半分
+    pasta = guest_count // 2
+    pizza = guest_count - pasta
+    return pasta, pizza
+
+
+def parse_main_counts_from_text(guest_count: int, text: str):
+    """
+    ブロック内のテキストからパスタ/ピザの人数を推定する。
+
+    - 「プラン名：〜」の行はカウント対象外
+    - 「プラン名」行の次の1行もカウント対象外（説明が続いているため）
+    - 回答部分に「ピザ」のみ → 全員ピザ
+    - 回答部分に「パスタ」のみ → 全員パスタ
+    - 両方出現 → 出現回数で比率判定
+    - どちらもない → デフォルト配分
+    """
+    text = str(text or "")
+
+    # ★ 行ごとに分割
+    lines = text.splitlines()
+
+    # ★ プラン名行 + その次の行を除外
+    skip_indices = set()
+    for i, ln in enumerate(lines):
+        if "プラン名" in ln:
+            skip_indices.add(i)
+            if i + 1 < len(lines):
+                skip_indices.add(i + 1)
+
+    answer_lines = [
+        ln for i, ln in enumerate(lines)
+        if i not in skip_indices
+    ]
+
+    # 回答テキストを結合
+    answer_text = "\n".join(answer_lines)
+
+    pasta_word = "パスタ"
+    pizza_word = "ピザ"
+
+    # パスタ・ピザの記述なし → デフォルト
+    if pasta_word not in answer_text and pizza_word not in answer_text:
+        p, z = _default_main_distribution(guest_count)
+        return {"パスタ": p, "ピザ": z}
+
+    # 出現回数カウント
+    pasta_occ = answer_text.count(pasta_word)
+    pizza_occ = answer_text.count(pizza_word)
+
+    # ★ 一方だけ出現する → 全員そのメイン
+    if pizza_occ > 0 and pasta_occ == 0:
+        return {"パスタ": 0, "ピザ": guest_count}
+    if pasta_occ > 0 and pizza_occ == 0:
+        return {"パスタ": guest_count, "ピザ": 0}
+
+    # 両方出現する場合は比率で分配
+    total_occ = pasta_occ + pizza_occ
+    if total_occ <= 0:
+        p, z = _default_main_distribution(guest_count)
+        return {"パスタ": p, "ピザ": z}
+
+    # 出現回数 = 人数 の場合はそのまま
+    if total_occ == guest_count:
+        return {"パスタ": pasta_occ, "ピザ": pizza_occ}
+
+    # 比率で補正
+    pasta_num = round(guest_count * pasta_occ / total_occ)
+    pizza_num = guest_count - pasta_num
+
+    return {
+        "パスタ": max(pasta_num, 0),
+        "ピザ": max(pizza_num, 0),
+    }
+
+
+
+
+# =========================
+# コース・予約系ヘルパー
+# =========================
 def course_has_main_item(course_id: str) -> bool:
     res = (
         supabase.table("course_items")
@@ -160,7 +267,6 @@ def is_slot_conflicted(reserved_at: datetime, table_no: str, exclude_reservation
     return False
 
 
-
 def create_reservation_and_progress(
     course_id,
     reserved_at,
@@ -243,7 +349,6 @@ def create_reservation_and_progress(
     return True, "予約とコース進行を登録しました。"
 
 
-
 def fetch_reservations_for_date(target_date: date):
     start_dt = datetime.combine(target_date, time(0, 0, 0))
     end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0, 0))
@@ -267,7 +372,6 @@ def fetch_reservations_for_date(target_date: date):
 
     rows.sort(key=sort_key)
     return rows
-
 
 
 def update_reservation_basic(
@@ -367,7 +471,6 @@ def update_reservation_basic(
     return True, "予約情報を更新しました。"
 
 
-
 def delete_reservation(reservation_id: str):
     """
     予約の削除。
@@ -382,6 +485,295 @@ def delete_reservation(reservation_id: str):
         return False, f"予約の削除に失敗しました: {e}"
 
 
+def delete_reservations_for_date(target_date: date):
+    """
+    指定日の予約を一括削除する。
+    course_progress 側に ON DELETE CASCADE が付いていれば連動して削除される。
+    """
+    start_dt = datetime.combine(target_date, time(0, 0, 0))
+    end_dt = start_dt + timedelta(days=1)
+
+    try:
+        (
+            supabase.table("course_reservations")
+            .delete()
+            .gte("reserved_at", start_dt.isoformat())
+            .lt("reserved_at", end_dt.isoformat())
+            .execute()
+        )
+        return True, f"{target_date.strftime('%Y/%m/%d')} の予約をすべて削除しました。"
+    except Exception as e:
+        return False, f"{target_date.strftime('%Y/%m/%d')} の一括削除に失敗しました: {e}"
+
+
+# =========================
+# Excel 解析ヘルパー
+# =========================
+def _parse_reservation_date_from_df(df: pd.DataFrame) -> date:
+    """
+    ExcelのA2などから予約日を取得。
+    '2025/12/01 (月)' のような文字列から日付部分だけを抜く。
+    見つからなければ get_today_jst() を返す。
+    """
+    reserve_date = get_today_jst()
+    try:
+        # 2行目あたりをざっくり見る
+        for col in range(min(5, df.shape[1])):
+            v = df.iat[1, col] if df.shape[0] > 1 else None
+            if isinstance(v, str):
+                m = re.search(r"(\d{4}/\d{1,2}/\d{1,2})", v)
+                if m:
+                    reserve_date = datetime.strptime(m.group(1), "%Y/%m/%d").date()
+                    break
+    except Exception:
+        pass
+    return reserve_date
+
+
+def _find_time_rows(df: pd.DataFrame):
+    """
+    A列の中から '18:00' などの時間が入っている行インデックスを取得。
+    """
+    time_rows = []
+    for idx, v in df[0].items():
+        if isinstance(v, str) and re.match(r"\d{1,2}:\d{2}", v.strip()):
+            time_rows.append(idx)
+    return time_rows
+
+
+def _detect_table_no(block_df: pd.DataFrame) -> Optional[str]:
+    """
+    ブロック内のD列からテーブル番号を推定。
+    '1-T5本棚' のようなケースもあるので、TABLE_OPTIONSの部分一致で最初に見つかったものを採用。
+    """
+    for _, row in block_df.iterrows():
+        val = row[3] if 3 in row else None
+        if not isinstance(val, str):
+            continue
+        s = val.strip()
+        if not s:
+            continue
+        for t in TABLE_OPTIONS:
+            if t in s:
+                return t
+    return None
+
+
+def _build_block_text(block_df: pd.DataFrame) -> str:
+    """
+    ブロック内の「コース」「備考」相当（E,F,G列 = index 4,5,6）を結合したテキスト。
+    """
+    texts = []
+    for _, row in block_df.iterrows():
+        for col in [4, 5, 6]:
+            if col in row:
+                v = row[col]
+                if isinstance(v, str) and v.strip():
+                    texts.append(v.strip())
+    return "\n".join(texts)
+
+
+def _normalize_text_for_course(s: str) -> str:
+    """
+    コース名マッチ用にテキストを正規化：
+    ・改行
+    ・スペース（半角・全角）
+    を削除する
+    """
+    return (
+        str(s or "")
+        .replace("\n", "")
+        .replace("\r", "")
+        .replace(" ", "")
+        .replace("　", "")
+    )
+
+
+def _longest_common_substring(a: str, b: str) -> int:
+    """
+    a, b の間で「連続して一致している部分文字列」の最大長を返す。
+    例: a='クリスマスディナー', b='クリスマスツリー' → 'クリスマス' で 5
+    """
+    max_len = 0
+    len_a, len_b = len(a), len(b)
+
+    for i in range(len_a):
+        for j in range(len_b):
+            l = 0
+            while i + l < len_a and j + l < len_b and a[i + l] == b[j + l]:
+                l += 1
+            if l > max_len:
+                max_len = l
+    return max_len
+
+
+def _detect_course_from_text(block_text: str, courses) -> Tuple[Optional[str], Optional[str]]:
+    """
+    ブロック内テキストとアプリに登録されているコース名を部分一致で紐づけ。
+    改行・空白を除去した上で、
+    - コース名全体が含まれていれば、その長さをスコア
+    - そうでなければ「連続して一致している部分」の最大長をスコア
+    最長スコアのコースを採用するが、スコアが6未満ならノーヒット扱いにする。
+      → 「クリスマス」(5文字) だけの一致では拾わない
+      → 「クリスマスディナー」など十分長い一致があれば拾う
+    """
+    norm = _normalize_text_for_course(block_text)
+
+    best_course = None
+    best_score = 0
+
+    for c in courses:
+        name = c.get("name") or ""
+        if not name:
+            continue
+
+        name_norm = _normalize_text_for_course(name)
+        if not name_norm:
+            continue
+
+        # 1) 片方がもう片方を完全に含んでいる場合
+        if name_norm in norm or norm in name_norm:
+            score = min(len(name_norm), len(norm))
+        else:
+            # 2) 最長共通部分文字列の長さをスコアにする
+            score = _longest_common_substring(name_norm, norm)
+
+        if score > best_score:
+            best_score = score
+            best_course = c
+
+    # ★ スコア6未満はノーヒット扱い（「クリスマス」単体などの誤検出を防ぐ）
+    if best_course and best_score >= 6:
+        return best_course["id"], best_course["name"]
+
+    return None, None
+
+
+
+
+
+
+def _detect_is_birthday(block_text: str) -> bool:
+    """
+    6・7列目の「備考」にクリスマスディナーコースが含まれている、かつ、
+    「バースデー」もしくは「プレート」が含まれている場合にTrue。
+    改行・スペースを除去した正規化テキストで判定する。
+    """
+    norm = _normalize_text_for_course(block_text)
+
+    if "クリスマスディナーコース" in norm and (
+        "バースデー" in norm or "プレート" in norm
+    ):
+        return True
+    return False
+
+
+
+
+def parse_excel_reservations(excel_file, courses):
+    """
+    Restyの予約Excelからコース予約候補を抽出する。
+
+    戻り値: list[dict]
+        {
+            "reserved_at": datetime,
+            "guest_name": str,
+            "guest_count": int,
+            "table_no": Optional[str],
+            "course_id": Optional[str],
+            "course_name": Optional[str],
+            "is_birthday": bool,
+            "main_counts": Optional[dict],
+            "main_choice": Optional[str],
+            "block_text": str,
+        }
+    """
+    df = pd.read_excel(excel_file, header=None)
+    reserve_date = _parse_reservation_date_from_df(df)
+    time_rows = _find_time_rows(df)
+
+    results = []
+
+    if not time_rows:
+        return results
+
+    # この日の有効コースのうち、「メイン」を持つコースを事前にメモ
+    main_course_ids = set()
+    for c in courses:
+        cid = c["id"]
+        try:
+            if course_has_main_item(cid):
+                main_course_ids.add(cid)
+        except Exception:
+            pass
+
+    for i, start in enumerate(time_rows):
+        end = time_rows[i + 1] - 1 if i + 1 < len(time_rows) else df.index[-1]
+        block_df = df.iloc[start : end + 1, :]
+
+        # 予約時間
+        time_raw = str(block_df.iat[0, 0]).strip()
+        mt = re.search(r"(\d{1,2}):(\d{2})", time_raw)
+        if not mt:
+            continue
+        hour, minute = int(mt.group(1)), int(mt.group(2))
+        reserved_time = time(hour, minute)
+        reserved_at = datetime.combine(reserve_date, reserved_time)
+
+        # お名前
+        guest_name = ""
+        val_name = block_df.iat[0, 1]
+        if isinstance(val_name, str):
+            guest_name = val_name.strip()
+
+        # 人数
+        guest_count = 1
+        val_guest = block_df.iat[0, 2]
+        if isinstance(val_guest, str):
+            mg = re.search(r"\d+", val_guest)
+            if mg:
+                guest_count = int(mg.group())
+
+        # テーブル番号
+        table_no = _detect_table_no(block_df)
+
+        # コース・備考テキスト
+        block_text = _build_block_text(block_df)
+
+        # コース判定
+        course_id, course_name = _detect_course_from_text(block_text, courses)
+
+        # バースデーフラグ
+        is_birthday = _detect_is_birthday(block_text)
+
+        # メイン人数
+        main_counts = None
+        main_choice = None
+        if course_id and course_id in main_course_ids:
+            main_counts = parse_main_counts_from_text(guest_count, block_text)
+            main_choice = counts_to_main_choice(main_counts)
+
+        results.append(
+            {
+                "reserved_at": reserved_at,
+                "guest_name": guest_name,
+                "guest_count": guest_count,
+                "table_no": table_no,
+                "course_id": course_id,
+                "course_name": course_name,
+                "is_birthday": is_birthday,
+                "main_counts": main_counts,
+                "main_choice": main_choice,
+                "block_text": block_text,
+            }
+        )
+
+    return results
+
+
+# =========================
+# メイン画面
+# =========================
 def show():
     st.subheader("コース予約登録")
 
@@ -528,7 +920,6 @@ def show():
                     is_birthday=is_birthday,
                 )
 
-
                 if ok:
                     # ★ 成功したらバージョンを +1 → 次の描画で key が全部変わるのでフォームが初期化される
                     st.session_state["reservation_form_version"] = form_version + 1
@@ -538,7 +929,94 @@ def show():
                     # 失敗時は入力を残したままエラー表示
                     st.error(msg)
 
+    # ======================
+    # Excelから予約取り込み
+    # ======================
+    st.markdown("### Excelから予約を取り込む")
 
+    excel_file = st.file_uploader(
+        "予約エクセルファイル（Resty出力 .xlsx）",
+        type=["xlsx"],
+        key="reservation_excel_uploader",
+    )
+
+    parsed_from_excel = []
+    if excel_file is not None:
+        try:
+            parsed_from_excel = parse_excel_reservations(excel_file, courses)
+        except Exception as e:
+            st.error(f"Excelの解析に失敗しました: {e}")
+
+    if parsed_from_excel:
+        total_count_excel = len(parsed_from_excel)
+        course_count_excel = sum(1 for r in parsed_from_excel if r["course_id"])
+
+        st.caption(
+            f"検出された予約件数: {total_count_excel}件 / "
+            f"このうちコースと紐付けできた予約: {course_count_excel}件"
+        )
+
+        # プレビュー表示
+        preview_rows = []
+        for r in parsed_from_excel:
+            preview_rows.append(
+                {
+                    "時間": r["reserved_at"].strftime("%H:%M"),
+                    "お名前": r["guest_name"],
+                    "人数": r["guest_count"],
+                    "テーブル": r["table_no"] or "",
+                    "コース": r["course_name"] or "",
+                    "バースデー": "○" if r["is_birthday"] else "",
+                    "メイン内訳": r["main_choice"] or "",
+                }
+            )
+        st.dataframe(pd.DataFrame(preview_rows))
+
+        if course_count_excel > 0:
+            if st.button("この内容でコース予約を一括登録する", key="btn_register_excel"):
+                success_count = 0
+                warn_messages = []
+
+                for r in parsed_from_excel:
+                    # コースと紐づいている予約のみ登録
+                    if not r["course_id"]:
+                        continue
+
+                    if not r["table_no"]:
+                        warn_messages.append(
+                            f"{r['guest_name']}様（{r['reserved_at'].strftime('%H:%M')}）: "
+                            f"テーブル番号が判定できなかったためスキップしました。"
+                        )
+                        continue
+
+                    ok, msg = create_reservation_and_progress(
+                        course_id=r["course_id"],
+                        reserved_at=r["reserved_at"],
+                        guest_name=r["guest_name"],
+                        guest_count=r["guest_count"],
+                        table_no=r["table_no"],
+                        note=r["block_text"],
+                        main_choice=r["main_choice"],
+                        main_detail_counts=r["main_counts"],
+                        is_birthday=r["is_birthday"],
+                    )
+                    if ok:
+                        success_count += 1
+                    else:
+                        warn_messages.append(
+                            f"{r['guest_name']}様（{r['reserved_at'].strftime('%H:%M')}）: {msg}"
+                        )
+
+                if success_count > 0:
+                    st.session_state["reservation_success_message"] = (
+                        f"Excelからコース予約を {success_count}件 登録しました。"
+                    )
+                    st.rerun()
+                else:
+                    st.info("登録できた予約はありませんでした。")
+
+                for m in warn_messages:
+                    st.warning(m)
 
     # ======================
     # 予約一覧（任意の日付）＋ 編集・削除
@@ -597,12 +1075,41 @@ def show():
     if course_lines:
         st.caption("コース別：" + " / ".join(course_lines))
 
+    # -------------------------
+    # ★ この日の予約を一括削除
+    # -------------------------
+    with st.expander("この日の予約を一括削除する", expanded=False):
+        st.warning(
+            f"{list_date.strftime('%Y/%m/%d')} の予約がすべて削除されます。"
+            "この操作は取り消せません。"
+        )
+        confirm_delete_all = st.checkbox(
+            "本当にこの日の全予約を削除する",
+            key=f"confirm_delete_all_{list_date.strftime('%Y%m%d')}",
+        )
+        delete_all_btn = st.button(
+            "この日の予約をすべて削除する",
+            key=f"delete_all_btn_{list_date.strftime('%Y%m%d')}",
+            disabled=not confirm_delete_all,
+        )
+
+        if delete_all_btn:
+            ok, msg = delete_reservations_for_date(list_date)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    # -------------------------
+    # 個別の予約 編集・削除
+    # -------------------------
     for r in reservations:
         res_time = datetime.fromisoformat(r["reserved_at"])
         main_label = ""
         if r.get("main_choice"):
             main_label = f" / メイン: {r['main_choice']}"
-        
+
         title = (
             f"{res_time.strftime('%Y-%m-%d %H:%M')} / "
             f"{(r['guest_name'] or 'お名前未入力')} 様 / "
@@ -742,7 +1249,6 @@ def show():
                             st.rerun()
                         else:
                             st.error(msg)
-
 
                 # 削除処理
                 if delete_btn:
