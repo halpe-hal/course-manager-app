@@ -1037,6 +1037,8 @@ def show():
     # 予約件数 + 時間帯別件数 + コース別件数
     # -------------------------
     total_count = len(reservations)
+    # ★ この日の合計人数
+    total_guests = sum(int(r.get("guest_count") or 0) for r in reservations)
 
     # 時間帯ごとにカウント
     time_counter = Counter()
@@ -1046,10 +1048,11 @@ def show():
         if time_str in TIME_OPTIONS:
             time_counter[time_str] += 1
 
-    # メイン表示（総件数）
+    # メイン表示（総件数 + 合計人数）
     st.markdown(
-        f"#### {list_date.strftime('%Y/%m/%d')} の予約件数：**{total_count}件**"
+        f"#### {list_date.strftime('%Y/%m/%d')} の予約件数：**{total_count}件**（合計人数：**{total_guests}名**）"
     )
+
 
     # 時間帯ごとの件数表示（すべてのスロットを表示）
     time_lines = []
