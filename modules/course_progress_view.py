@@ -81,6 +81,21 @@ def to_jst(dt: Optional[datetime]):
 def get_now_jst():
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
+def sort_reservation_for_board(resv: dict):
+    """
+    進行ボード用の並び順:
+    1) status が "arrived" の予約を先頭（arrived_flag=0）
+    2) それ以外（未来店）を後ろ（arrived_flag=1）
+    その中では「予約時間 → テーブル番号順」
+    """
+    status = (resv.get("status") or "reserved").lower()
+    arrived_flag = 0 if status == "arrived" else 1
+    dt = datetime.fromisoformat(resv["reserved_at"])
+    table = resv.get("table_no") or ""
+    table_idx = TABLE_ORDER.get(table, 999)
+    return (arrived_flag, dt, table_idx)
+
+
 
 # 予約ステータスを更新（reserved / arrived など）
 def set_reservation_status(reservation_id: str, status: str):
@@ -90,6 +105,24 @@ def set_reservation_status(reservation_id: str, status: str):
         ).eq("id", reservation_id).execute()
     except Exception as e:
         st.error(f"予約ステータスの更新に失敗しました: {e}")
+
+
+# ★追加：人数タグ付与ヘルパー
+def add_guest_prefix_if_needed(name: str, guest_count: Optional[int], is_main: bool) -> str:
+    """
+    3名様以上のとき、メイン以外の商品名の先頭に【3名】のような人数タグを付ける（赤文字）。
+    """
+    if not guest_count or guest_count < 3:
+        return name
+    if is_main:
+        return name
+
+    # すでに人数タグが付いている場合は二重付与しない
+    if name.startswith("【") and "名】" in name.split("】", 1)[0]:
+        return name
+
+    return f"<span style='color:#d9534f; font-weight:700;'>【{guest_count}名】</span>{name}"
+
 
 
 # 調理フラグを更新（True / False）
@@ -276,14 +309,9 @@ def show_board():
         st.info("該当日のコース予約はありません。")
         return
 
-    # 時間 → テーブル順で並べ替え
-    def sort_key_resv(r):
-        dt = datetime.fromisoformat(r["reserved_at"])
-        table = r.get("table_no") or ""
-        table_idx = TABLE_ORDER.get(table, 999)
-        return (dt, table_idx)
+    # ★ 来店済み優先 + 時間 → テーブル順
+    reservations = sorted(reservations, key=sort_reservation_for_board)
 
-    reservations = sorted(reservations, key=sort_key_resv)
 
     # ここでコンテナの横幅を「予約数 × 300px」で決める（初期値）
     per_card_width = 300
@@ -363,13 +391,15 @@ def show_board():
                 progress_by_res.get(resv_id, []),
                 key=lambda x: x["scheduled_time"],
             )
+            
 
             # ★ この予約がバースデー利用かどうか
             is_birthday = bool(resv.get("is_birthday"))
 
-            # ===== 見出し：時間 / 名前＋人数 / テーブル =====
+            # ★ 追加：人数（数値 / 表示用）を分けて持つ
             guest_name = (resv.get("guest_name") or "お名前未入力")
-            guest_count = resv.get("guest_count") or "-"
+            guest_count_value = resv.get("guest_count")       # 数値（None or int）
+            guest_count_label = guest_count_value if guest_count_value is not None else "-"  # 表示用
             table_label = f"{resv.get('table_no') or '-'}"
             st.markdown(
                 f"""
@@ -386,7 +416,7 @@ def show_board():
                         {resv_time.strftime('%H:%M')}
                     </div>
                     <div>
-                        {guest_name} 様（{guest_count} 名）
+                        {guest_name} （{guest_count_label} 名）
                     </div>
                     <div style="
                         font-weight:700;
@@ -443,7 +473,6 @@ def show_board():
                 is_served = p.get("is_served", False)  # ここは全部 False のはずだが念のため
 
                 # ★ 予定時刻から3分以上たっても未配膳なら「遅延」判定
-                # ★ 予定時刻から3分以上たっても未配膳なら「遅延」判定
                 now_dt = get_now_jst().replace(tzinfo=None)  # JST 現在時刻（naive）
                 is_overdue = (not is_served) and ((now_dt - sched_time) >= timedelta(minutes=3))
 
@@ -458,13 +487,22 @@ def show_board():
 
                 if item["item_name"] == "メイン":
                     base_name = detail or "メイン"
+                    is_main_item = True
                 else:
                     base_name = item["item_name"]
+                    is_main_item = False
 
                 if qty and qty > 1:
                     display_name = f"{base_name} ：{qty}"
                 else:
                     display_name = base_name
+
+                # ★ ここで人数タグを付与（3名様以上 & メイン以外）
+                display_name = add_guest_prefix_if_needed(
+                    display_name,
+                    guest_count_value,
+                    is_main_item,
+                )
 
                 # ★ HBD ラベル（バースデー＋「コースの最後の course_item」のときだけ付ける）
                 hbd_prefix = ""
@@ -650,7 +688,8 @@ def show_cooked_list():
         with cols[idx]:
             resv_time = datetime.fromisoformat(resv["reserved_at"])
             guest_name = (resv.get("guest_name") or "お名前未入力")
-            guest_count = resv.get("guest_count") or "-"
+            guest_count_value = resv.get("guest_count")  # 数値
+            guest_count_label = guest_count_value if guest_count_value is not None else "-"
             table_no = resv.get("table_no") or "-"
 
             # 予約ヘッダー（時間＋名前＋人数）※来店済み表記は無し
@@ -669,7 +708,7 @@ def show_cooked_list():
                         {resv_time.strftime('%H:%M')}
                     </div>
                     <div>
-                        {guest_name} 様（{guest_count} 名）
+                        {guest_name} （{guest_count_label} 名）
                     </div>
                     <div style="font-size:20px; color:#d9534f; margin-left:2px; font-weight:bold;">
                         {resv.get('table_no') or '-'}
@@ -698,20 +737,29 @@ def show_cooked_list():
                 cooked_at = parse_dt(p["cooked_at"])
                 cooked_at_jst = to_jst(cooked_at)
 
-                # ★ メイン詳細（main_detail）＆数量(quantity)に対応
+                                # ★ メイン詳細（main_detail）＆数量(quantity)に対応
                 detail = p.get("main_detail")
                 qty = p.get("quantity", 1)
 
                 if item["item_name"] == "メイン":
                     base_name = detail or "メイン"
+                    is_main_item = True
                 else:
                     base_name = item["item_name"]
+                    is_main_item = False
 
                 # 数量が2以上なら ×で表示
                 if qty and qty > 1:
                     display_name = f"{base_name} ×{qty}"
                 else:
                     display_name = base_name
+
+                # ★ ここで人数タグを付ける（3名様以上 & メイン以外）
+                display_name = add_guest_prefix_if_needed(
+                    display_name,
+                    guest_count_value,
+                    is_main_item,
+                )
 
                 # ★ HBD（バースデー＋「コース本来の最後の商品」にだけ付ける）
                 course_id = resv.get("course_id")
@@ -720,6 +768,7 @@ def show_cooked_list():
                     hbd_item_id = last_item_by_course.get(course_id)
                     if hbd_item_id and (p["course_item_id"] == hbd_item_id):
                         display_name = f"【HBD】{display_name}"
+
 
                 # 時間表示
                 time_label = cooked_at_jst.strftime('%H:%M') if cooked_at_jst else "--:--"
@@ -861,8 +910,10 @@ def show_served_list():
         with cols[idx]:
             resv_time = datetime.fromisoformat(resv["reserved_at"])
             guest_name = (resv.get("guest_name") or "お名前未入力")
-            guest_count = resv.get("guest_count") or "-"
+            guest_count_value = resv.get("guest_count")  # 数値
+            guest_count_label = guest_count_value if guest_count_value is not None else "-"
             table_no = resv.get("table_no") or "-"
+
 
             # 予約ヘッダー（時間＋名前＋人数＋テーブル）※ステータス表記なし
             st.markdown(
@@ -880,7 +931,7 @@ def show_served_list():
                         {resv_time.strftime('%H:%M')}
                     </div>
                     <div>
-                        {guest_name} 様（{guest_count} 名）
+                        {guest_name} （{guest_count_label} 名）
                     </div>
                     <div style="font-size:20px; color:#d9534f; margin-left:2px; font-weight:bold;">
                         {table_no}
@@ -915,13 +966,22 @@ def show_served_list():
 
                 if item["item_name"] == "メイン":
                     base_name = detail or "メイン"
+                    is_main_item = True
                 else:
                     base_name = item["item_name"]
+                    is_main_item = False
 
                 if qty and qty > 1:
                     display_name = f"{base_name} ×{qty}"
                 else:
                     display_name = base_name
+
+                # ★ ここで人数タグを付ける（3名様以上 & メイン以外）
+                display_name = add_guest_prefix_if_needed(
+                    display_name,
+                    guest_count_value,
+                    is_main_item,
+                )
 
                 # ★ HBD（バースデー＋「コース本来の最後の商品」にだけ付ける）
                 course_id = resv.get("course_id")
@@ -930,6 +990,7 @@ def show_served_list():
                     hbd_item_id = last_item_by_course.get(course_id)
                     if hbd_item_id and (p["course_item_id"] == hbd_item_id):
                         display_name = f"【HBD】{display_name}"
+
 
                 time_label = served_at_jst.strftime('%H:%M') if served_at_jst else "--:--"
 
