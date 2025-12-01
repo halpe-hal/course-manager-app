@@ -6,9 +6,14 @@ from collections import Counter
 from .supabase_client import supabase
 from typing import Optional, Tuple
 from .time_utils import get_today_jst
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill, Font
+from openpyxl.styles import Border, Side
+import unicodedata
 
 import pandas as pd
 import re
+import io
 
 # テーブル番号の選択肢
 TABLE_OPTIONS = [
@@ -772,6 +777,338 @@ def parse_excel_reservations(excel_file, courses):
 
 
 # =========================
+# EXCELダウンロード系
+# =========================
+
+
+# Supabase の TIMESTAMPをローカル時刻として扱うための簡易パーサー
+def parse_local_scheduled_time(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    base = dt_str.split("Z")[0].split("+")[0]
+    if len(base) > 19:
+        base = base[:19]
+    return datetime.fromisoformat(base)
+
+
+def parse_local_scheduled_time(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    base = dt_str.split("Z")[0].split("+")[0]
+    if len(base) > 19:
+        base = base[:19]
+    return datetime.fromisoformat(base)
+
+
+def generate_dinner_excel(target_date: date) -> bytes:
+    """
+    指定日の course_reservations / course_progress から、
+    ディナー予約管理用のExcelを生成して bytes を返す。
+
+    追加仕様:
+      ・バースデー利用の最後の商品に【HBD】（is_birthday カラムで判定）
+      ・3名以上の場合のメイン以外の料理名に【人数名】
+    """
+
+    start_dt = datetime.combine(target_date, time(0, 0, 0))
+    end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0, 0))
+
+    # is_birthday を含めて取得（これが必須）
+    res_resv = (
+        supabase.table("course_reservations")
+        .select("id, reserved_at, guest_name, guest_count, table_no, status, is_birthday")
+        .gte("reserved_at", start_dt.isoformat())
+        .lt("reserved_at", end_dt.isoformat())
+        .neq("status", "cancelled")
+        .order("reserved_at", desc=False)
+        .execute()
+    )
+    reservations = res_resv.data or []
+
+    if not reservations:
+        df = pd.DataFrame(
+            [
+                ["来店チェック"],
+                ["時刻"],
+            ],
+            columns=["来店チェック"],
+        )
+        return df_to_excel_bytes(df)
+
+    resv_map = {r["id"]: r for r in reservations}
+
+    # course_progress
+    res_prog = (
+        supabase.table("course_progress")
+        .select("reservation_id, course_item_id, scheduled_time, main_detail, quantity")
+        .in_("reservation_id", list(resv_map.keys()))
+        .order("scheduled_time", desc=False)
+        .execute()
+    )
+    progress_rows = res_prog.data or []
+
+    # course_items
+    item_ids = list({p["course_item_id"] for p in progress_rows}) if progress_rows else []
+    item_map = {}
+    if item_ids:
+        res_items = (
+            supabase.table("course_items")
+            .select("id, item_name")
+            .in_("id", item_ids)
+            .execute()
+        )
+        item_map = {i["id"]: i for i in (res_items.data or [])}
+
+    # 時刻一覧
+    time_labels = set()
+    for p in progress_rows:
+        dt = parse_local_scheduled_time(p["scheduled_time"])
+        if dt:
+            time_labels.add(dt.strftime("%H:%M"))
+    time_list = sorted(time_labels)
+
+    # DataFrame 骨組み
+    n_rows = 3 + len(time_list)
+    cols = ["来店チェック"] + [f"予約{idx+1}" for idx in range(len(reservations))]
+    df = pd.DataFrame("", index=range(n_rows), columns=cols)
+
+    df.iat[0, 0] = "来店チェック"
+    df.iat[1, 0] = "時刻"
+
+    # テーブル番号
+    for j, resv in enumerate(reservations, start=1):
+        df.iat[1, j] = resv.get("table_no") or ""
+
+    # 苗字様（人数）
+    for j, resv in enumerate(reservations, start=1):
+        surname = extract_surname(resv.get("guest_name") or "")
+        guest_count = resv.get("guest_count") or ""
+        if surname:
+            df.iat[2, j] = f"{surname}様({guest_count})"
+        else:
+            df.iat[2, j] = f"({guest_count})"
+
+    for i, tl in enumerate(time_list, start=3):
+        df.iat[i, 0] = tl
+
+    if not progress_rows:
+        return df_to_excel_bytes(df)
+
+    # ===== cell_map（時刻 × 予約） =====
+    cell_map: dict[tuple[str, str], list[str]] = {}
+
+    # 予約ごとの「最後の時刻」記録（HBD用）
+    last_dt_by_resv: dict[str, datetime] = {}
+
+    for p in progress_rows:
+        rid = p["reservation_id"]
+        dt = parse_local_scheduled_time(p["scheduled_time"])
+        if not dt:
+            continue
+        time_label = dt.strftime("%H:%M")
+
+        # 最後の時刻を更新
+        if (rid not in last_dt_by_resv) or (dt > last_dt_by_resv[rid]):
+            last_dt_by_resv[rid] = dt
+
+        # 料理名
+        item = item_map.get(p["course_item_id"])
+        if not item:
+            continue
+        original_item_name = item["item_name"]
+        base_name = original_item_name
+
+        # メインの詳細
+        if base_name == "メイン":
+            detail = p.get("main_detail")
+            if detail:
+                base_name = detail
+
+        qty = p.get("quantity", 1) or 1
+        text = f"{base_name}{qty}" if qty > 1 else base_name
+
+        # 3名以上 → メイン以外に人数名
+        gc = resv_map[rid].get("guest_count") or 0
+        try:
+            gc = int(gc)
+        except:
+            gc = 0
+
+        if gc >= 3 and original_item_name != "メイン":
+            text = f"{text}【{gc}名】"
+
+        key = (time_label, rid)
+        cell_map.setdefault(key, []).append(text)
+
+    # 予約ごとに “最後の時刻ラベル” を作る
+    last_label_by_resv = {
+        rid: dt.strftime("%H:%M") for rid, dt in last_dt_by_resv.items()
+    }
+
+    # ===== DF に書き込み + is_birthday による HBD 付与 =====
+    time_index_map = {tl: (3 + i) for i, tl in enumerate(time_list)}
+    resv_col_map = {resv["id"]: (1 + j) for j, resv in enumerate(reservations)}
+
+    for (time_label, rid), texts in cell_map.items():
+        row_idx = time_index_map[time_label]
+        col_idx = resv_col_map[rid]
+        joined = "/".join(texts)
+
+        # is_birthday を型安全に判定
+        raw_flag = resv_map[rid].get("is_birthday")
+        is_birthday = False
+        if isinstance(raw_flag, bool):
+            is_birthday = raw_flag
+        elif isinstance(raw_flag, (int, float)):
+            is_birthday = (raw_flag != 0)
+        elif isinstance(raw_flag, str):
+            is_birthday = raw_flag.lower() in ("1", "true", "t", "yes", "y")
+
+        # 最後の時間のセルに HBD
+        if is_birthday:
+            last_label = last_label_by_resv.get(rid)
+            if last_label == time_label:
+                joined = f"{joined}【HBD】"
+
+        df.iat[row_idx, col_idx] = joined
+
+    return df_to_excel_bytes(df)
+
+
+
+
+
+
+def extract_surname(name: str) -> str:
+    """
+    氏名から苗字だけを取り出す。
+    例: '山田 太郎' / '山田　太郎' → '山田'
+    """
+    if not name:
+        return ""
+    # 全角スペースを半角スペースに揃える
+    normalized = name.replace("　", " ").strip()
+    parts = [p for p in normalized.split(" ") if p]
+    return parts[0] if parts else normalized
+
+
+def df_to_excel_bytes(df: "pd.DataFrame", sheet_name: str = "全体") -> bytes:
+    """
+    DataFrame を Excel バイト列に変換。
+    ・列幅を中身（文字列長）に合わせて自動調整
+    ・テーブル番号行（2行目）と 1〜5商品目行に色付け
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # header=False にして、DataFrame の中身をそのままセルに落とす
+        df.to_excel(writer, index=False, header=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+
+        # ===== 列幅の自動調整（全角・半角に対応した正確バージョン）=====
+
+        def excel_display_length(s: str) -> int:
+            """
+            Excelの表示に近い形で“幅”を計算する。
+            - 全角 → 1.8〜2.0
+            - 半角 → 1.0
+            """
+            length = 0
+            for ch in s:
+                # 全角 (Wide / Fullwidth)
+                if unicodedata.east_asian_width(ch) in ("W", "F"):
+                    length += 2
+                else:
+                    length += 1
+            return length
+
+        for col_idx, _ in enumerate(df.columns, 1):
+            col_letter = get_column_letter(col_idx)
+            max_len = 0
+
+            for cell in ws[col_letter]:
+                if cell.value is None:
+                    continue
+                text = str(cell.value)
+                disp_len = excel_display_length(text)
+                if disp_len > max_len:
+                    max_len = disp_len
+
+            # Excelの列幅は「文字数 × 0.9〜1.1」で調整されるので補正を掛ける
+            ws.column_dimensions[col_letter].width = max_len * 1.2
+
+        # === テーブル番号行（2行目）の色付け：背景黒・文字白 ===
+        table_fill = PatternFill(fill_type="solid", fgColor="000000")
+        table_font = Font(color="FFFFFF", bold=True)
+        max_col = df.shape[1]
+
+        # B列以降（予約列）だけ色を付ける
+        for col_idx in range(2, max_col + 1):
+            cell = ws.cell(row=2, column=col_idx)
+            if cell.value not in (None, ""):
+                cell.fill = table_fill
+                cell.font = table_font
+
+        # === 1〜5商品目の色付け（列ごとに「上から何個目の料理か」で判定）===
+        # 1商品目 ▶︎背景薄青、文字青
+        # 2商品目 ▶︎背景薄オレンジ、文字オレンジ
+        # 3商品目 ▶︎背景薄赤、文字赤
+        # 4商品目 ▶︎背景赤、文字白
+        # 5商品目 ▶︎背景薄緑、文字緑
+        product_styles = {
+            1: {"bg": "E6F4FF", "fg": "1A73E8"},  # 1商品目：薄青
+            2: {"bg": "FFEFD6", "fg": "EA8600"},  # 2商品目：薄オレンジ
+            3: {"bg": "FFE6E6", "fg": "D93025"},  # 3商品目：薄赤
+            4: {"bg": "D93025", "fg": "FFFFFF"},  # 4商品目：赤地に白字
+            5: {"bg": "E6F4EA", "fg": "188038"},  # 5商品目：薄緑
+        }
+
+        max_col = df.shape[1]
+        max_row = ws.max_row
+
+        # データ行は 4行目(=row=4)〜
+        data_start_row = 4
+
+        # 各予約列ごとに上から順に数えて色をつける
+        for col_idx in range(2, max_col + 1):  # B列以降
+            count = 0  # その列での「商品番号」（1商品目,2商品目,...）
+
+            for row in range(data_start_row, max_row + 1):
+                cell = ws.cell(row=row, column=col_idx)
+                if cell.value in (None, ""):
+                    continue
+
+                count += 1
+                style = product_styles.get(count)
+                if not style:
+                    # 6商品目以降は色を付けない
+                    continue
+
+                fill = PatternFill(fill_type="solid", fgColor=style["bg"])
+                font = Font(color=style["fg"])
+                cell.fill = fill
+                cell.font = font
+
+        # ===== 黒い枠線を全セルにつける =====
+        thin = Side(border_style="thin", color="000000")
+        border = Border(top=thin, left=thin, right=thin, bottom=thin)
+
+        # データ範囲すべてに枠線
+        max_row = ws.max_row
+        max_col = ws.max_column
+
+        for row in ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
+            for cell in row:
+                cell.border = border
+
+
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
+
+
+# =========================
 # メイン画面
 # =========================
 def show():
@@ -984,7 +1321,7 @@ def show():
 
                     if not r["table_no"]:
                         warn_messages.append(
-                            f"{r['guest_name']}様（{r['reserved_at'].strftime('%H:%M')}）: "
+                            f"{r['guest_name']}（{r['reserved_at'].strftime('%H:%M')}）: "
                             f"テーブル番号が判定できなかったためスキップしました。"
                         )
                         continue
@@ -1004,7 +1341,7 @@ def show():
                         success_count += 1
                     else:
                         warn_messages.append(
-                            f"{r['guest_name']}様（{r['reserved_at'].strftime('%H:%M')}）: {msg}"
+                            f"{r['guest_name']}（{r['reserved_at'].strftime('%H:%M')}）: {msg}"
                         )
 
                 if success_count > 0:
@@ -1029,6 +1366,16 @@ def show():
     if not reservations:
         st.info("該当日の予約は登録されていません。")
         return
+    
+    # 対象日のディナー予約表をExcelダウンロード
+    excel_bytes = generate_dinner_excel(list_date)
+    st.download_button(
+        label="この日のディナー予約表をExcelダウンロード（ディナー予約管理形式）",
+        data=excel_bytes,
+        file_name=f"ディナー予約管理_{list_date.strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
 
     # course_id → name のマップ（表示用）
     course_map = {c["id"]: c["name"] for c in courses}
@@ -1115,7 +1462,7 @@ def show():
 
         title = (
             f"{res_time.strftime('%Y-%m-%d %H:%M')} / "
-            f"{(r['guest_name'] or 'お名前未入力')} 様 / "
+            f"{(r['guest_name'] or 'お名前未入力')}  / "
             f"テーブル: {r['table_no'] or '-'} / "
             f"コース: {course_map.get(r['course_id'], '不明')}"
             f"{main_label}"
